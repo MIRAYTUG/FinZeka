@@ -276,39 +276,110 @@ def crypto_candles(symbol: str, interval: str = '1h', limit: int = 200):
     except (requests.RequestException, ValueError, TypeError, IndexError):
         raise HTTPException(503, 'Kripto grafiği şu an alınamıyor')
 
+# Twelve Data spot FX/metals quotes; API key is server-side only.
+TROY_OUNCE_GRAMS = 31.1034768
+
+def twelve_quote(symbol):
+    api_key = os.getenv('TWELVE_DATA_API_KEY', '').strip()
+    if not api_key:
+        return None
+    try:
+        resp = requests.get('https://api.twelvedata.com/quote',
+                            params={'symbol': symbol, 'apikey': api_key}, timeout=12)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict) or data.get('status') == 'error' or data.get('code'):
+            return None
+        price = finite(data.get('close') or data.get('price'), 8)
+        if price is None or price <= 0:
+            return None
+        timestamp = data.get('datetime') or data.get('timestamp')
+        pct = finite(data.get('percent_change'), 3)
+        return {'price': price, 'change_pct': pct, 'observed_at': timestamp,
+                'source': 'Twelve Data', 'status': 'Sağlayıcının son kotasyonu; gecikme aboneliğe bağlı',
+                'realtime': False}
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+
+def licensed_quotes():
+    if not os.getenv('TWELVE_DATA_API_KEY'):
+        return {}
+    now = time.monotonic()
+    key = ('licensed-quotes', 'v1')
+    # Do not burn paid credits for every visitor/10-second UI refresh.
+    ttl = max(60, int(os.getenv('MARKET_QUOTES_CACHE_SECONDS', '120')))
+    if key in CACHE and now - CACHE[key][0] < ttl:
+        return CACHE[key][1]
+    symbols = {'USD/TRY': 'USD/TRY', 'EUR/TRY': 'EUR/TRY',
+               'XAU/USD': 'XAU/USD', 'XAG/USD': 'XAG/USD'}
+    brent_symbol = os.getenv('TWELVE_BRENT_SYMBOL', '').strip()
+    if brent_symbol:
+        symbols['BRENT'] = brent_symbol
+    result = {key: value for key, symbol in symbols.items()
+              if (value := twelve_quote(symbol)) is not None}
+    CACHE[key] = (now, result)
+    return result
+
 @app.get('/api/market-strip')
 def market_strip():
-    key = ('market-strip', 'v3')
+    key = ('market-strip', 'v4')
     now = time.monotonic()
     if key in CACHE and now - CACHE[key][0] < 10:
         return CACHE[key][1]
     items = []
-    # 24s kripto değişimi; son işlem fiyatları API çağrısı anında alınır.
     try:
         for a in crypto()['assets']:
             if a['symbol'] in ('BTC', 'ETH', 'SOL'):
-                items.append({'kind':'crypto', 'symbol':a['symbol']+'/USDT',
-                              'price':a['last'], 'change_pct':a['change24h'],
-                              'source':'Binance Spot', 'realtime':False,
-                              'status':'Son işlem (10 sn sorgu)',
-                              'observed_at':datetime.now(timezone.utc).isoformat()})
-    except HTTPException:
+                items.append({'kind': 'crypto', 'symbol': a['symbol']+'/USDT',
+                              'price': a['last'], 'change_pct': a['change24h'],
+                              'source': 'Binance Spot', 'realtime': False,
+                              'status': 'Son işlem; 10 saniye aralıkla sorgulama',
+                              'observed_at': datetime.now(timezone.utc).isoformat(),
+                              'currency': 'USDT'})
+    except (HTTPException, KeyError):
         pass
-    # TCMB gösterge kuru gerçek zamanlı değildir ve gün içinde sabit kalabilir.
-    try:
-        rates = fx()
-        for cur in ('USD','EUR'):
-            row = rates['rates'].get(cur, {})
-            if row.get('sell') is not None:
-                items.append({'kind':'fx', 'symbol':cur+'/TRY','price':row['sell'],
-                              'change_pct':None, 'source':'TCMB', 'realtime':False,
-                              'status':'Gösterge satış kuru', 'observed_at':rates['date']})
-    except HTTPException:
-        pass
+    quotes = licensed_quotes()
+    fx_prices = {}
+    for cur in ('USD', 'EUR'):
+        row = quotes.get(cur+'/TRY')
+        if row:
+            fx_prices[cur] = row['price']
+            items.append({'kind': 'fx', 'symbol': cur+'/TRY', 'currency': 'TRY', **row})
+    if not all(cur in fx_prices for cur in ('USD','EUR')):
+        try:
+            rates = fx()
+            for cur in ('USD', 'EUR'):
+                if cur in fx_prices: continue
+                row = rates['rates'].get(cur, {})
+                if row.get('sell') is not None:
+                    items.append({'kind': 'fx', 'symbol': cur+'/TRY', 'currency': 'TRY',
+                                  'price': row['sell'], 'change_pct': None,
+                                  'source': 'TCMB', 'realtime': False,
+                                  'status': 'Günlük gösterge satış kuru',
+                                  'observed_at': rates['date']})
+                    if cur == 'USD': fx_prices[cur] = row['sell']
+        except HTTPException:
+            pass
+    # XAU and XAG are USD per troy ounce. These are *indicative spot conversions*,
+    # not jeweler selling prices, BIST gold prices or official gram gold quotes.
+    usd_try = fx_prices.get('USD')
+    for metal, label in (('XAU/USD', 'GOLD'), ('XAG/USD', 'SILVER')):
+        quote = quotes.get(metal)
+        if quote and usd_try:
+            derived = quote['price'] * usd_try / TROY_OUNCE_GRAMS
+            items.append({'kind': 'metal', 'symbol': label, 'currency': 'TRY/g',
+                          'price': finite(derived, 4), 'change_pct': None,
+                          'source': 'Twelve Data spot + USD/TRY', 'realtime': False,
+                          'status': 'Ons spot dönüşümü (gösterge); serbest piyasa gram satış fiyatı değildir',
+                          'observed_at': quote['observed_at']})
+    if quotes.get('BRENT'):
+        items.append({'kind': 'energy', 'symbol': 'BRENT', 'currency': 'USD/varil',
+                      **quotes['BRENT']})
     if not items:
         raise HTTPException(503, 'Piyasa şeridi verileri şu anda alınamıyor')
-    result={'items':items, 'fetched_at':datetime.now(timezone.utc).isoformat(),
-            'refresh_seconds':10,
-            'note':'Kripto son işlem sorgusudur; TCMB günlük gösterge kurudur. Canlı döviz, altın, gümüş ve Brent için lisanslı veri sağlayıcısı henüz bağlı değildir.'}
-    CACHE[key]=(now,result)
+    result = {'items': items,
+              'fetched_at': datetime.now(timezone.utc).isoformat(),
+              'refresh_seconds': 10,
+              'note': 'Kripto: Binance son işlem. Döviz/metaller: aboneliğe göre son kotasyon veya TCMB günlük gösterge. Gram metal: spot ons dönüşümü. Brent için doğru sembol ve veri hakkı gereklidir.'}
+    CACHE[key] = (now, result)
     return result
