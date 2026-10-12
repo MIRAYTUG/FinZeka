@@ -225,3 +225,90 @@ def ask(q:Question):
         return {'answer':'Araç çağırma sınırına ulaşıldı, lütfen soruyu daraltın.','sources':used}
     except Exception as e:
         raise HTTPException(502,f'LLM servisi yanıt veremedi: {type(e).__name__}')
+
+# --- v3: unified asset search, crypto candles and market ticker strip ---
+@app.get('/api/search')
+def unified_search(q: str = '', limit: int = 20):
+    term = q.upper().strip()
+    if len(term) > 32:
+        raise HTTPException(400, 'Arama çok uzun')
+    limit = max(1, min(limit, 50))
+    stocks = [{'type': 'stock', 'symbol': s, 'name': n, 'tv_symbol': 'BIST:' + s}
+              for s, n in SYMBOLS.items() if term in s or term in n.upper()]
+    stocks.sort(key=lambda x: (not x['symbol'].startswith(term), x['symbol']))
+    coins = []
+    try:
+        crypto_pairs = active_crypto_pairs()
+        coins = [{'type': 'crypto', 'symbol': s, 'name': x['name'],
+                  'pair': x['pair'], 'tv_symbol': 'BINANCE:' + x['pair']}
+                 for s, x in crypto_pairs.items() if term in s or term in x['name'].upper()]
+        coins.sort(key=lambda x: (not x['symbol'].startswith(term), x['symbol']))
+    except HTTPException:
+        if not stocks:
+            raise
+    results = (stocks + coins)[:limit]
+    return {'query': term, 'results': results, 'total_matches': len(stocks) + len(coins),
+            'crypto_available': bool(coins) or term == '',
+            'note': 'Kripto kapsamı Binance aktif USDT spot çiftleriyle sınırlıdır.'}
+
+@app.get('/api/crypto/{symbol}/candles')
+def crypto_candles(symbol: str, interval: str = '1h', limit: int = 200):
+    code = symbol.upper().strip().removesuffix('USDT')
+    pair = active_crypto_pairs().get(code)
+    if pair is None:
+        raise HTTPException(404, 'Aktif USDT spot çifti bulunamadı')
+    if interval not in ('5m', '15m', '1h', '4h', '1d', '1w'):
+        raise HTTPException(400, 'Geçersiz grafik zaman aralığı')
+    limit = max(2, min(limit, 500))
+    try:
+        r = requests.get('https://data-api.binance.vision/api/v3/klines',
+                         params={'symbol': pair['pair'], 'interval': interval, 'limit': limit}, timeout=15)
+        r.raise_for_status()
+        bars = [{'time': datetime.fromtimestamp(x[0]/1000, timezone.utc).isoformat(),
+                 'open': finite(x[1], 10), 'high': finite(x[2], 10),
+                 'low': finite(x[3], 10), 'close': finite(x[4], 10),
+                 'volume': finite(x[5], 6)} for x in r.json()]
+        if not bars:
+            raise ValueError('Boş grafik verisi')
+        return {'symbol': code, 'pair': pair['pair'], 'interval': interval,
+                'source': 'Binance Spot', 'retrieved_at': datetime.now(timezone.utc).isoformat(),
+                'bars': bars, 'note': 'Son mum henüz tamamlanmamış olabilir.'}
+    except (requests.RequestException, ValueError, TypeError, IndexError):
+        raise HTTPException(503, 'Kripto grafiği şu an alınamıyor')
+
+@app.get('/api/market-strip')
+def market_strip():
+    key = ('market-strip', 'v3')
+    now = time.monotonic()
+    if key in CACHE and now - CACHE[key][0] < 10:
+        return CACHE[key][1]
+    items = []
+    # 24s kripto değişimi; son işlem fiyatları API çağrısı anında alınır.
+    try:
+        for a in crypto()['assets']:
+            if a['symbol'] in ('BTC', 'ETH', 'SOL'):
+                items.append({'kind':'crypto', 'symbol':a['symbol']+'/USDT',
+                              'price':a['last'], 'change_pct':a['change24h'],
+                              'source':'Binance Spot', 'realtime':False,
+                              'status':'Son işlem (10 sn sorgu)',
+                              'observed_at':datetime.now(timezone.utc).isoformat()})
+    except HTTPException:
+        pass
+    # TCMB gösterge kuru gerçek zamanlı değildir ve gün içinde sabit kalabilir.
+    try:
+        rates = fx()
+        for cur in ('USD','EUR'):
+            row = rates['rates'].get(cur, {})
+            if row.get('sell') is not None:
+                items.append({'kind':'fx', 'symbol':cur+'/TRY','price':row['sell'],
+                              'change_pct':None, 'source':'TCMB', 'realtime':False,
+                              'status':'Gösterge satış kuru', 'observed_at':rates['date']})
+    except HTTPException:
+        pass
+    if not items:
+        raise HTTPException(503, 'Piyasa şeridi verileri şu anda alınamıyor')
+    result={'items':items, 'fetched_at':datetime.now(timezone.utc).isoformat(),
+            'refresh_seconds':10,
+            'note':'Kripto son işlem sorgusudur; TCMB günlük gösterge kurudur. Canlı döviz, altın, gümüş ve Brent için lisanslı veri sağlayıcısı henüz bağlı değildir.'}
+    CACHE[key]=(now,result)
+    return result
